@@ -146,55 +146,40 @@ if GITHUB_TOKEN and REPO:
     except: pass
 reconcile_partial_fills()
 garbage_collect_memory()
+
 # ==============================================================================
 # UNIVERSAL RISK ORGANS (Ported from NSE V1 Architecture)
 # ==============================================================================
 def check_volume_participation(ticker, proposed_qty, max_participation_pct=0.05):
-    """
-    NSE Persona 4 Port: Ensures our order size does not exceed 5% of the 
-    stock's 30-day average daily volume to prevent slippage and market impact.
-    """
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="2mo")
         avg_volume = float(hist['Volume'].tail(30).mean())
-        
         max_allowed_qty = math.floor(avg_volume * max_participation_pct)
-        
         if proposed_qty > max_allowed_qty:
             print(f"   🛑 VOLUME GOVERNOR: {ticker} order ({proposed_qty}) exceeds 5% of avg volume ({max_allowed_qty}). Capping size.")
             return max_allowed_qty
         return proposed_qty
     except:
-        return proposed_qty # Fail open if volume data is missing
+        return proposed_qty
 
 def stress_test_margin(proposed_order_value):
-    """
-    NSE Persona 5 Port: Simulates a 15% market flash-crash.
-    If the simulated equity drops below Alpaca's Maintenance Margin requirement,
-    block the trade to prevent a forced margin call liquidation.
-    """
     try:
         account_res = requests.get(f"{BASE_URL}/v2/account", headers=ALPACA_HEADERS)
-        if account_res.status_code != 200: return True # Fail open
-        
+        if account_res.status_code != 200: return True
         acc = account_res.json()
         current_equity = float(acc.get('equity', 0))
         maintenance_margin = float(acc.get('maintenance_margin', 0))
-        
-        # Simulate a 15% flash crash on our current long exposure
         long_market_value = float(acc.get('long_market_value', 0))
         simulated_equity = current_equity - (long_market_value * 0.15) - (proposed_order_value * 0.15)
-        
-        # Add a 10% buffer above the broker's hard maintenance margin
         safety_threshold = maintenance_margin * 1.10 
-        
         if simulated_equity < safety_threshold:
             print(f"   🛑 MARGIN STRESS TEST FAILED: Simulated crash breaches maintenance margin. Trade blocked.")
-            return False # Block the trade
-        return True # Trade is safe
+            return False
+        return True
     except:
         return True
+
 # ==============================================================================
 # ORGAN 1 & 16: JANITOR & CHRONO-VELOCITY
 # ==============================================================================
@@ -244,10 +229,8 @@ try:
     vix_data = yf.download("^VIX", period="10d", progress=False)
     vix_series = vix_data['Close']['^VIX'] if isinstance(vix_data.columns, pd.MultiIndex) else vix_data['Close']
     vix = float(vix_series.iloc[-1]); vix_5d = (vix / float(vix_series.iloc[-5])) - 1
-    term = "backwardation" if vix > 25 else "contango" # Simplified proxy
+    term = "backwardation" if vix > 25 else "contango"
     
-    # Proxy for Breadth (Using SPY RSI as a proxy for internal momentum if breadth API isn't available)
-    # In a real fund, you'd pull NYSE % > 200DMA here. We'll use a safe default.
     breadth_proxy = 0.60 if spy_current > spy_sma200 else 0.35 
     
     state = {
@@ -258,7 +241,6 @@ try:
     
     print(f"  [STATE] VIX: {vix:.1f} | SPY Ext: {spy_ext:.1%} | Credit Z: {cs_z_score:.1f}")
 
-    # GROQ AI ROUTING
     groq_strategy = None
     if GROQ_KEY:
         print("  🧠 [GROQ] Querying Strategy Router...")
@@ -288,7 +270,6 @@ except Exception as e:
     state = {"vix": 40, "spy_sma": -0.10, "breadth": 0.20, "cs_z": 3.0}
     groq_strategy = "CRISIS_CASH"
 
-# Map Groq Strategy to Execution Variables
 if groq_strategy and groq_strategy in STRATEGY_LIBRARY:
     active_strat = STRATEGY_LIBRARY[groq_strategy]
     UNIVERSE = active_strat["universe"]
@@ -297,7 +278,6 @@ if groq_strategy and groq_strategy in STRATEGY_LIBRARY:
     tp_mult = active_strat["tp_mult"]
     time_stop = active_strat["time_stop"]
 else:
-    # Fallback if Groq fails
     if state['vix'] >= 25 or state['spy_sma'] <= -0.05: UNIVERSE = []; risk_frac = 0; sl_mult = 0; tp_mult = 0; time_stop = 0
     else: UNIVERSE = ["NVDA", "AMD", "MSFT", "META", "TSLA", "AVGO"]; risk_frac = 0.005; sl_mult = 3.0; tp_mult = None; time_stop = 60
 
@@ -374,7 +354,7 @@ calendar_action = chronos_calendar(now)
 if calendar_action == "LIQUIDATE_WEEKEND_RISK": print("  🗑️ [CHRONOS] Friday Afternoon. Liquidating weekend risk.")
 
 # ==============================================================================
-# EXECUTION HANDS
+# EXECUTION HANDS (FULLY RESTORED WITH NSE RISK GATES)
 # ==============================================================================
 print("\n⚔️ [HANDS] Executing with Guardrails...")
 todays_predictions = []
@@ -392,8 +372,7 @@ for c in candidates:
         tr = pd.concat([hist.High - hist.Low, (hist.High - hist.Close.shift()).abs(), (hist.Low - hist.Close.shift()).abs()], axis=1).max(axis=1)
         atr = float(tr.rolling(14).mean().iloc[-1]) 
         
-        # DYNAMIC SIZING & STOPS BASED ON GROQ STRATEGY
-        if risk_frac == 0: continue # Strategy says stand down
+        if risk_frac == 0: continue 
         
         sl_pct = (sl_mult * atr) / current_price
         risk_budget = 100000 * risk_frac
@@ -409,6 +388,39 @@ for c in candidates:
         if not stress_test_margin(order_value):
             print(f"   🚫 {ticker}: Blocked by Margin Stress Test.")
             continue
+
+        # --- ACTUAL EXECUTION & ROUTING ---
+        side = "buy" if direction == "BULLISH" else "sell"
+        limit_p = round(current_price * 1.001, 2) if side=="buy" else round(current_price * 0.999, 2)
+        sl_p = round(current_price * (1 - sl_pct), 2) if side=="buy" else round(current_price * (1 + sl_pct), 2)
+        
+        order_data = {"symbol": ticker, "qty": str(qty), "side": side, "type": "limit", "limit_price": str(limit_p), "time_in_force": "day"}
+        
+        if tp_mult:
+            order_data["order_class"] = "bracket"
+            tp_pct = (tp_mult * atr) / current_price
+            tp_p = round(current_price * (1 + tp_pct), 2) if side=="buy" else round(current_price * (1 - tp_pct), 2)
+            order_data["take_profit"] = {"limit_price": str(tp_p)}
+            order_data["stop_loss"] = {"stop_price": str(sl_p)}
+        else:
+            order_data["order_class"] = "limit"
+            order_data["stop_loss"] = {"stop_price": str(sl_p)}
+            
+        allowed, reason = validate_swing_order("NEW", 0, qty, 0, sl_p)
+        if not allowed: 
+            print(f"   🚫 {ticker}: Guardrail Blocked ({reason})")
+            continue
+
+        res = requests.post(f"{BASE_URL}/v2/orders", headers=ALPACA_HEADERS, json=order_data)
+        if res.status_code in [200, 201]:
+            order_id = res.json().get('id')
+            print(f"  ✅ {ticker} ({direction}) QUEUED | Qty: {qty}")
+            todays_predictions.append({"order_id": order_id, "ticker": ticker, "catalyst": catalyst, "direction": direction, "entry": limit_p, "atr": atr, "max_hold_days": time_stop, "status": "PENDING", "date": datetime.now(timezone.utc).isoformat()})
+        else:
+            print(f"  ❌ {ticker} REJECTED: {res.text[:50]}")
+            
+    except Exception as e:
+        print(f"  [ERROR] Execution failed for {ticker}: {e}")
 
 # ==============================================================================
 # ORGAN 8: HIPPOCAMPUS WRITE
