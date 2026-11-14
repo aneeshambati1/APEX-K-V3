@@ -146,7 +146,55 @@ if GITHUB_TOKEN and REPO:
     except: pass
 reconcile_partial_fills()
 garbage_collect_memory()
+# ==============================================================================
+# UNIVERSAL RISK ORGANS (Ported from NSE V1 Architecture)
+# ==============================================================================
+def check_volume_participation(ticker, proposed_qty, max_participation_pct=0.05):
+    """
+    NSE Persona 4 Port: Ensures our order size does not exceed 5% of the 
+    stock's 30-day average daily volume to prevent slippage and market impact.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="2mo")
+        avg_volume = float(hist['Volume'].tail(30).mean())
+        
+        max_allowed_qty = math.floor(avg_volume * max_participation_pct)
+        
+        if proposed_qty > max_allowed_qty:
+            print(f"   🛑 VOLUME GOVERNOR: {ticker} order ({proposed_qty}) exceeds 5% of avg volume ({max_allowed_qty}). Capping size.")
+            return max_allowed_qty
+        return proposed_qty
+    except:
+        return proposed_qty # Fail open if volume data is missing
 
+def stress_test_margin(proposed_order_value):
+    """
+    NSE Persona 5 Port: Simulates a 15% market flash-crash.
+    If the simulated equity drops below Alpaca's Maintenance Margin requirement,
+    block the trade to prevent a forced margin call liquidation.
+    """
+    try:
+        account_res = requests.get(f"{BASE_URL}/v2/account", headers=ALPACA_HEADERS)
+        if account_res.status_code != 200: return True # Fail open
+        
+        acc = account_res.json()
+        current_equity = float(acc.get('equity', 0))
+        maintenance_margin = float(acc.get('maintenance_margin', 0))
+        
+        # Simulate a 15% flash crash on our current long exposure
+        long_market_value = float(acc.get('long_market_value', 0))
+        simulated_equity = current_equity - (long_market_value * 0.15) - (proposed_order_value * 0.15)
+        
+        # Add a 10% buffer above the broker's hard maintenance margin
+        safety_threshold = maintenance_margin * 1.10 
+        
+        if simulated_equity < safety_threshold:
+            print(f"   🛑 MARGIN STRESS TEST FAILED: Simulated crash breaches maintenance margin. Trade blocked.")
+            return False # Block the trade
+        return True # Trade is safe
+    except:
+        return True
 # ==============================================================================
 # ORGAN 1 & 16: JANITOR & CHRONO-VELOCITY
 # ==============================================================================
@@ -352,31 +400,15 @@ for c in candidates:
         stop_distance = sl_pct * current_price
         qty = max(1, math.floor(risk_budget / stop_distance))
         
-        side = "buy" if direction == "BULLISH" else "sell"
-        limit_p = round(current_price * 1.001, 2) if side=="buy" else round(current_price * 0.999, 2)
-        sl_p = round(current_price * (1 - sl_pct), 2) if side=="buy" else round(current_price * (1 + sl_pct), 2)
+        # --- NSE V1 UPGRADE 1: VOLUME PARTICIPATION GOVERNOR ---
+        qty = check_volume_participation(ticker, qty)
+        if qty <= 0: continue
         
-        order_data = {"symbol": ticker, "qty": str(qty), "side": side, "type": "limit", "limit_price": str(limit_p), "time_in_force": "day"}
-        
-        if tp_mult:
-            order_data["order_class"] = "bracket"
-            tp_pct = (tp_mult * atr) / current_price
-            tp_p = round(current_price * (1 + tp_pct), 2) if side=="buy" else round(current_price * (1 - tp_pct), 2)
-            order_data["take_profit"] = {"limit_price": str(tp_p)}
-            order_data["stop_loss"] = {"stop_price": str(sl_p)}
-        else:
-            order_data["order_class"] = "limit"
-            order_data["stop_loss"] = {"stop_price": str(sl_p)}
-            
-        allowed, reason = validate_swing_order("NEW", 0, qty, 0, sl_p)
-        if not allowed: continue
-
-        res = requests.post(f"{BASE_URL}/v2/orders", headers=ALPACA_HEADERS, json=order_data)
-        if res.status_code in [200, 201]:
-            order_id = res.json().get('id')
-            print(f"  ✅ {ticker} ({direction}) QUEUED | Qty: {qty}")
-            todays_predictions.append({"order_id": order_id, "ticker": ticker, "catalyst": catalyst, "direction": direction, "entry": limit_p, "atr": atr, "max_hold_days": time_stop, "status": "PENDING", "date": datetime.now(timezone.utc).isoformat()})
-    except: pass
+        # --- NSE V1 UPGRADE 2: STRESSED MARGIN CHECK ---
+        order_value = qty * current_price
+        if not stress_test_margin(order_value):
+            print(f"   🚫 {ticker}: Blocked by Margin Stress Test.")
+            continue
 
 # ==============================================================================
 # ORGAN 8: HIPPOCAMPUS WRITE
