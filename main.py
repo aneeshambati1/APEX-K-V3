@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 print("="*70)
-print("🌌 APEX-K V11.0: THE AUDITED MASTERPIECE 🌌")
+print("🌌 APEX-K V12.0: THE ELITE MASTERPIECE 🌌")
 print("="*70)
 
 # ==============================================================================
@@ -35,21 +35,25 @@ BASE_URL = "https://paper-api.alpaca.markets"
 ALPACA_HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET, "Content-Type": "application/json"}
 GH_HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"} if GITHUB_TOKEN else {}
 
-memory = {"_sha": None, "predictions": [], "multipliers": {}, "version": 0, "win_rate": 0.5}
+memory = {"_sha": None, "predictions": [], "multipliers": {}, "version": 0, "win_rate": 0.5, "strategy_stats": {}}
 
 # ==============================================================================
-# V11.0 STRATEGY LIBRARY & VERIFICATION GATE
+# V12.0 STRATEGY LIBRARY (Expanded)
 # ==============================================================================
 STRATEGY_LIBRARY = {
     "AGGRESSIVE_MOMENTUM": {"universe": ["NVDA", "AMD", "MSFT", "META", "TSLA", "AVGO"], "risk_frac": 0.005, "sl_mult": 3.0, "tp_mult": None, "time_stop": 60},
     "DEFENSIVE_MOMENTUM": {"universe": ["MSFT", "AAPL", "JNJ", "PG", "KO"], "risk_frac": 0.0025, "sl_mult": 2.0, "tp_mult": 2.0, "time_stop": 10},
     "MEAN_REVERSION_SWING": {"universe": ["SPY", "QQQ", "XLU", "XLP", "WMT"], "risk_frac": 0.0025, "sl_mult": 2.0, "tp_mult": 1.5, "time_stop": 3},
     "CRISIS_CASH": {"universe": [], "risk_frac": 0, "sl_mult": 0, "tp_mult": 0, "time_stop": 0},
-    "VOLATILITY_HARVEST": {"universe": [], "risk_frac": 0, "sl_mult": 0, "tp_mult": 0, "time_stop": 0},
+    "VOLATILITY_HARVEST": {"universe": ["SVXY"], "risk_frac": 0.005, "sl_mult": 2.0, "tp_mult": 1.5, "time_stop": 10},
     "V_SHAPE_RECOVERY": {"universe": ["SPY", "QQQ", "XLF", "XLI", "XLY"], "risk_frac": 0.005, "sl_mult": 2.5, "tp_mult": None, "time_stop": 30},
-    "GRINDING_BEAR_AVOIDANCE": {"universe": [], "risk_frac": 0, "sl_mult": 0, "tp_mult": 0, "time_stop": 0}
+    "GRINDING_BEAR_AVOIDANCE": {"universe": [], "risk_frac": 0, "sl_mult": 0, "tp_mult": 0, "time_stop": 0},
+    "SECTOR_ROTATION": {"universe": ["XLK","XLF","XLE","XLV","XLI","XLY","XLP","XLU","XLB","XLRE","XLC"], "risk_frac": 0.004, "sl_mult": 2.5, "tp_mult": 3.0, "time_stop": 15}
 }
 
+# ==============================================================================
+# VERIFICATION GATE (Upgraded)
+# ==============================================================================
 def verify_proposal(proposal, state):
     strat = proposal.get("selected_strategy", "CRISIS_CASH")
     conf = proposal.get("confidence", 0)
@@ -57,7 +61,18 @@ def verify_proposal(proposal, state):
     if state['cs_z'] > 2.5 and strat not in ["CRISIS_CASH", "GRINDING_BEAR_AVOIDANCE"]: return "CRISIS_CASH", f"OVERRIDDEN: Credit Z > 2.5."
     if state['vix'] > 35 and strat in ["AGGRESSIVE_MOMENTUM", "MEAN_REVERSION_SWING", "V_SHAPE_RECOVERY"]: return "CRISIS_CASH", f"OVERRIDDEN: VIX > 35."
     if state.get('term_ratio', 1.0) > 1.15: return "CRISIS_CASH", f"OVERRIDDEN: VIX backwardation {state.get('term_ratio', 0):.2f} > 1.15."
-    if state['spy_sma'] < -0.05 and state['breadth'] < 0.40 and state['vix'] < 25 and strat not in ["GRINDING_BEAR_AVOIDANCE", "CRISIS_CASH"]: return "GRINDING_BEAR_AVOIDANCE", f"OVERRIDDEN: Bearish internals."
+    
+    # NEW: DXY + Yields spiking override
+    if state.get('dxy_5d', 0) > 0.015 and state.get('tnx_5d', 0) > 0.10:
+        if strat in ["AGGRESSIVE_MOMENTUM", "V_SHAPE_RECOVERY"]:
+            return "DEFENSIVE_MOMENTUM", f"OVERRIDDEN: DXY + yields both spiking."
+    
+    # NEW: VOLATILITY_HARVEST only allowed in deep contango
+    if strat == "VOLATILITY_HARVEST" and state.get('term_ratio', 1.0) >= 0.85:
+        return "CRISIS_CASH", f"OVERRIDDEN: VIX not in deep contango ({state.get('term_ratio', 0):.2f})."
+    
+    if state['spy_sma'] < -0.05 and state['breadth'] < 0.40 and state['vix'] < 25 and strat not in ["GRINDING_BEAR_AVOIDANCE", "CRISIS_CASH"]: 
+        return "GRINDING_BEAR_AVOIDANCE", f"OVERRIDDEN: Bearish internals."
     return strat, f"VERIFIED: {strat} ({conf}% conf)."
 
 def extract_json(text):
@@ -119,13 +134,12 @@ def reconcile_partial_fills():
     except: pass
 
 def garbage_collect_memory():
-    if len(memory.get("predictions", [])) > 100: memory["predictions"] = memory["predictions"][-100:]
+    if len(memory.get("predictions", [])) > 200: memory["predictions"] = memory["predictions"][-200:]
 
 # ==============================================================================
-# PORTFOLIO HEAT CAP (Prevents Over-Leverage)
+# P2: PORTFOLIO HEAT CAP
 # ==============================================================================
 def get_portfolio_heat():
-    """Sum of open risk = |entry - stop| * qty across all positions"""
     try:
         pos = requests.get(f"{BASE_URL}/v2/positions", headers=ALPACA_HEADERS).json()
         orders = requests.get(f"{BASE_URL}/v2/orders?status=open&nested=true&limit=200", headers=ALPACA_HEADERS).json()
@@ -133,7 +147,7 @@ def get_portfolio_heat():
     heat = 0.0
     for p in pos:
         entry = float(p.get('avg_entry_price', 0)); qty = abs(int(float(p.get('qty', 0))))
-        stop = entry * 0.97  # default fallback 3%
+        stop = entry * 0.97
         for o in orders:
             if o.get('symbol') == p['symbol'] and o.get('type') in ('stop','stop_limit'):
                 stop = float(o.get('stop_price', stop)); break
@@ -141,7 +155,7 @@ def get_portfolio_heat():
     return heat
 
 # ==============================================================================
-# DAILY DRAWDOWN CIRCUIT BREAKER
+# P2: DAILY DRAWDOWN CIRCUIT BREAKER
 # ==============================================================================
 def drawdown_breaker():
     try:
@@ -156,24 +170,66 @@ def drawdown_breaker():
     except: return True
 
 # ==============================================================================
-# TRADING HOURS GUARD
+# P2: TRADING HOURS GUARD
 # ==============================================================================
 def in_trading_window():
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5: return False
-    # 13:35–19:45 UTC = 9:35–3:45 ET (avoid open/close turbulence)
     mins = now.hour * 60 + now.minute
     return 13*60+35 <= mins <= 19*60+45
 
 # ==============================================================================
-# LEARN MULTIPLIERS (Activate Learning System)
+# P2: MACRO EVENT BLACKOUT CALENDAR
+# ==============================================================================
+def macro_blackout():
+    """Return True if within 48h before a tier-1 macro event."""
+    now = datetime.now(timezone.utc).date()
+    TIER1 = [
+        "2026-12-16", "2027-01-27", "2027-03-17", "2027-05-05", "2027-06-16",  # FOMC
+        "2026-12-10", "2027-01-13", "2027-02-10", "2027-03-10", "2027-04-14",  # CPI
+        "2026-12-05", "2027-01-08", "2027-02-05", "2027-03-05", "2027-04-02",  # NFP
+    ]
+    for ev in TIER1:
+        ev_date = datetime.fromisoformat(ev).date()
+        if 0 <= (ev_date - now).days <= 2:
+            print(f"  📅 [MACRO] Tier-1 event on {ev_date} < 48h. No new entries.")
+            return True
+    return False
+
+# ==============================================================================
+# P2: CORRELATION-AWARE POSITION SIZING
+# ==============================================================================
+def portfolio_beta_penalty(ticker, existing_tickers):
+    """Reduce size if ticker is highly correlated with existing positions."""
+    if not existing_tickers:
+        return 1.0
+    try:
+        px = yf.download([ticker] + existing_tickers, period="3mo", progress=False)['Close']
+        if isinstance(px.columns, pd.MultiIndex):
+            px = px.droplevel(0, axis=1)
+        px = px.dropna()
+        if len(px.columns) < 2: return 1.0
+        corr = px.pct_change().corr()
+        if ticker not in corr.columns: return 1.0
+        corr_series = corr[ticker].drop(ticker, errors='ignore')
+        avg_corr = corr_series.mean() if len(corr_series) > 0 else 0.0
+        if avg_corr > 0.85: return 0.25
+        if avg_corr > 0.70: return 0.50
+        if avg_corr > 0.50: return 0.75
+        return 1.0
+    except:
+        return 1.0
+
+# ==============================================================================
+# P0 FIX: LEARN MULTIPLIERS (with per-strategy tracking)
 # ==============================================================================
 def learn_multipliers():
-    """Update catalyst multipliers from closed trades."""
+    """Update catalyst multipliers AND per-strategy win rates from closed trades."""
     try:
         filled = requests.get(f"{BASE_URL}/v2/orders?status=filled&limit=200&direction=desc", headers=ALPACA_HEADERS).json()
     except: return
     mults = memory.get("multipliers", {})
+    
     for p in memory.get("predictions", []):
         if p.get("_evaluated") or not p.get("order_id"): continue
         fill = next((f for f in filled if f.get('id') == p['order_id']), None)
@@ -192,12 +248,35 @@ def learn_multipliers():
         mults[cat] = round(max(0.5, min(2.0, current * adj)), 3)
         p['_evaluated'] = True
         p['_outcome_pct'] = round(pnl_pct, 4)
+    
     memory["multipliers"] = mults
+    
+    # Global win rate
     wins = sum(1 for p in memory["predictions"] if p.get("_outcome_pct", 0) > 0)
     total = sum(1 for p in memory["predictions"] if "_outcome_pct" in p)
     if total > 0:
         memory["win_rate"] = round(wins / total, 3)
-        print(f"  [LEARN] Win rate: {memory['win_rate']:.1%} | Multipliers: {len(mults)} catalysts")
+    
+    # NEW: Per-strategy win rate tracking
+    strat_stats = {}
+    for p in memory["predictions"]:
+        if "_outcome_pct" not in p: continue
+        s = p.get("strategy", "UNKNOWN")
+        if s not in strat_stats:
+            strat_stats[s] = {"wins": 0, "total": 0}
+        strat_stats[s]["total"] += 1
+        if p["_outcome_pct"] > 0: strat_stats[s]["wins"] += 1
+    for s, v in strat_stats.items():
+        v["wr"] = round(v["wins"] / v["total"], 3) if v["total"] > 0 else 0.5
+    memory["strategy_stats"] = strat_stats
+    
+    # Auto-de-weight underperforming strategies (10+ samples, <40% WR)
+    for s, v in strat_stats.items():
+        if v["total"] >= 10 and v["wr"] < 0.40 and s in STRATEGY_LIBRARY:
+            STRATEGY_LIBRARY[s]["risk_frac"] *= 0.5
+            print(f"  ⚠️ [ADAPT] {s} underperforming ({v['wr']:.1%} on {v['total']} trades). Risk halved.")
+    
+    print(f"  [LEARN] Win rate: {memory['win_rate']:.1%} | Catalysts: {len(mults)} | Strategies: {len(strat_stats)}")
 
 # ==============================================================================
 # ORGAN 9: ORACLE & ORGAN 8: HIPPOCAMPUS
@@ -227,7 +306,7 @@ reconcile_partial_fills()
 garbage_collect_memory()
 
 # ==============================================================================
-# UNIVERSAL RISK ORGANS (Ported from NSE V1 Architecture)
+# NSE-PORTED RISK ORGANS
 # ==============================================================================
 def check_volume_participation(ticker, proposed_qty, max_participation_pct=0.05):
     try:
@@ -260,7 +339,7 @@ def stress_test_margin(proposed_order_value):
         return True
 
 # ==============================================================================
-# ORGAN 1: JANITOR (FIXED: Preserve Protective Stops)
+# ORGAN 1: JANITOR (Preserves Protective Stops)
 # ==============================================================================
 print("\n🧹 [ORGAN 1: JANITOR] Scrubbing Only Entry Orders...")
 try:
@@ -279,7 +358,7 @@ except Exception as e:
     print(f"  [WARN] Janitor error: {e}")
 
 # ==============================================================================
-# ORGAN 16: CHRONO-VELOCITY (FIXED: Don't Wipe History)
+# ORGAN 16: CHRONO-VELOCITY (P0 FIX: cancel_orders=true)
 # ==============================================================================
 print("\n⏱️ [ORGAN 16: CHRONO-VELOCITY] Managing Open Positions...")
 try:
@@ -298,11 +377,18 @@ try:
         pnl_dollars = (current_price - entry_price) * qty if side == "long" else (entry_price - current_price) * qty
         current_pnl_atr = abs(pnl_dollars / (qty * atr)) if atr > 0 else 0
         decision, reason = adaptive_time_manager(days_held, current_pnl_atr, max_hold, current_price, entry_price)
+        
+        # P0 FIX: Use DELETE with cancel_orders=true to prevent orphan bracket legs
         if decision in ["EARLY_EJECT", "STANDARD_EXIT"]:
-            print(f"   ✂️ {ticker}: {decision}. Liquidating.")
-            close_side = "sell" if side == "long" else "buy"
-            requests.post(f"{BASE_URL}/v2/orders", headers=ALPACA_HEADERS, json={"symbol": ticker, "qty": str(qty), "side": close_side, "type": "market", "time_in_force": "day"})
-            # FIXED: Mark as CLOSED instead of deleting
+            print(f"   ✂️ {ticker}: {decision}. Closing position + canceling bracket legs.")
+            try:
+                requests.delete(
+                    f"{BASE_URL}/v2/positions/{ticker}?cancel_orders=true",
+                    headers=ALPACA_HEADERS
+                )
+            except Exception as e:
+                print(f"   [ERROR] Close failed for {ticker}: {e}")
+            # Mark as CLOSED (don't delete — preserve for learning)
             for p in memory["predictions"]:
                 if p.get("ticker") == ticker and p.get("status") != "CLOSED":
                     p["status"] = "CLOSED"
@@ -314,7 +400,7 @@ try:
 except Exception as e: print(f"  [ERROR] Position management failed: {e}")
 
 # ==============================================================================
-# ORGAN 5/10: GROQ STRATEGY ROUTER & COMPASS (FIXED: Real VIX Term Structure)
+# ORGAN 5/10: GROQ STRATEGY ROUTER & COMPASS (with Cross-Asset Inputs)
 # ==============================================================================
 print("\n🧭 [ORGAN 5/10: COMPASS & GROQ ROUTER] Assessing Regime...")
 try:
@@ -328,7 +414,7 @@ try:
     vix_series = vix_data['Close']['^VIX'] if isinstance(vix_data.columns, pd.MultiIndex) else vix_data['Close']
     vix = float(vix_series.iloc[-1]); vix_5d = (vix / float(vix_series.iloc[-5])) - 1
     
-    # FIXED: Real VIX Term Structure (VIX / VIX3M)
+    # Real VIX Term Structure
     try:
         vix3m_data = yf.download("^VIX3M", period="10d", progress=False)
         vix3m_series = vix3m_data['Close']['^VIX3M'] if isinstance(vix3m_data.columns, pd.MultiIndex) else vix3m_data['Close']
@@ -338,22 +424,45 @@ try:
     except:
         vix3m, term_ratio, term = vix * 1.1, 1.0, "unknown"
     
-    # FIXED: Real Breadth (Sector ETFs)
+    # Real Breadth (Sector ETFs)
     SECTOR_ETFS = ["XLK","XLF","XLE","XLV","XLI","XLY","XLP","XLU","XLB","XLRE","XLC"]
     try:
         sect = yf.download(SECTOR_ETFS, period="3mo", progress=False)['Close']
+        if isinstance(sect.columns, pd.MultiIndex):
+            sect = sect.droplevel(0, axis=1)
         above = sum(1 for t in SECTOR_ETFS if sect[t].iloc[-1] > sect[t].rolling(50).mean().iloc[-1])
         breadth = above / len(SECTOR_ETFS)
     except:
         breadth = 0.5
     
+    # NEW: Cross-Asset Regime Inputs (DXY, 10Y, Gold)
+    try:
+        dxy = yf.download("DX-Y.NYB", period="1mo", progress=False)['Close']
+        if isinstance(dxy.columns, pd.MultiIndex): dxy = dxy.droplevel(0, axis=1)
+        dxy_series = dxy['DX-Y.NYB'] if 'DX-Y.NYB' in dxy.columns else dxy.iloc[:, 0]
+        dxy_ret_5d = float(dxy_series.iloc[-1] / dxy_series.iloc[-6] - 1)
+        
+        tnx = yf.download("^TNX", period="1mo", progress=False)['Close']
+        if isinstance(tnx.columns, pd.MultiIndex): tnx = tnx.droplevel(0, axis=1)
+        tnx_series = tnx['^TNX'] if '^TNX' in tnx.columns else tnx.iloc[:, 0]
+        tnx_chg_5d = float(tnx_series.iloc[-1] - tnx_series.iloc[-6])
+        
+        gld = yf.download("GLD", period="1mo", progress=False)['Close']
+        if isinstance(gld.columns, pd.MultiIndex): gld = gld.droplevel(0, axis=1)
+        gld_series = gld['GLD'] if 'GLD' in gld.columns else gld.iloc[:, 0]
+        gld_ret_5d = float(gld_series.iloc[-1] / gld_series.iloc[-6] - 1)
+    except:
+        dxy_ret_5d = tnx_chg_5d = gld_ret_5d = 0.0
+    
     state = {
         "vix": vix, "vix_5d": vix_5d, "term": term, "term_ratio": term_ratio,
         "spy_sma": spy_ext, "spy_20d": spy_20d_ret,
-        "cs_z": cs_z_score, "breadth": breadth
+        "cs_z": cs_z_score, "breadth": breadth,
+        "dxy_5d": dxy_ret_5d, "tnx_5d": tnx_chg_5d, "gld_5d": gld_ret_5d
     }
     
-    print(f"  [STATE] VIX: {vix:.1f} | Term: {term} ({term_ratio:.2f}) | Breadth: {breadth:.1%} | Credit Z: {cs_z_score:.1f}")
+    print(f"  [STATE] VIX: {vix:.1f} ({term} {term_ratio:.2f}) | Breadth: {breadth:.1%} | Credit Z: {cs_z_score:.1f}")
+    print(f"  [CROSS] DXY 5d: {dxy_ret_5d:+.2%} | 10Y Δ: {tnx_chg_5d:+.2f}bps | GLD 5d: {gld_ret_5d:+.2%}")
 
     groq_strategy = None
     if GROQ_KEY:
@@ -367,8 +476,12 @@ try:
             
             if target_model:
                 prompt = f"""You are APEX-K Strategy Router. Select the optimal strategy.
-MARKET STATE: VIX={state['vix']:.1f} (5d Chg: {state['vix_5d']:.1%}), Term={state['term']} ({term_ratio:.2f}), SPY vs SMA={state['spy_sma']:.1%}, Breadth={state['breadth']:.1%}, Credit Z={state['cs_z']:.2f}.
-STRATEGIES: AGGRESSIVE_MOMENTUM, DEFENSIVE_MOMENTUM, MEAN_REVERSION_SWING, CRISIS_CASH, VOLATILITY_HARVEST, V_SHAPE_RECOVERY, GRINDING_BEAR_AVOIDANCE.
+MARKET STATE:
+- VIX={state['vix']:.1f} (5d Chg: {state['vix_5d']:.1%}), Term={state['term']} (ratio {term_ratio:.2f})
+- SPY vs SMA={state['spy_sma']:.1%}, SPY 20d={state['spy_20d']:.1%}
+- Breadth={state['breadth']:.1%}, Credit Z={state['cs_z']:.2f}
+- DXY 5d: {dxy_ret_5d:+.2%}, 10Y Δ: {tnx_chg_5d:+.2f}bps, Gold 5d: {gld_ret_5d:+.2%}
+STRATEGIES: AGGRESSIVE_MOMENTUM, DEFENSIVE_MOMENTUM, MEAN_REVERSION_SWING, CRISIS_CASH, VOLATILITY_HARVEST, V_SHAPE_RECOVERY, GRINDING_BEAR_AVOIDANCE, SECTOR_ROTATION.
 RESPOND IN EXACT JSON: {{"selected_strategy": "NAME", "confidence": 85, "reasoning": "1 sentence."}}"""
                 
                 payload = {"model": target_model, "messages": [{"role": "system", "content": "Output ONLY valid JSON."}, {"role": "user", "content": prompt}], "temperature": 0.1}
@@ -381,7 +494,9 @@ RESPOND IN EXACT JSON: {{"selected_strategy": "NAME", "confidence": 85, "reasoni
                     
 except Exception as e:
     print(f"  [ERROR] Router failed: {e}. Defaulting to CRISIS.")
-    state = {"vix": 40, "vix_5d": 0.0, "term": "backwardation", "term_ratio": 1.2, "spy_sma": -0.10, "spy_20d": -0.05, "breadth": 0.20, "cs_z": 3.0}
+    state = {"vix": 40, "vix_5d": 0.0, "term": "backwardation", "term_ratio": 1.2, 
+             "spy_sma": -0.10, "spy_20d": -0.05, "breadth": 0.20, "cs_z": 3.0,
+             "dxy_5d": 0.0, "tnx_5d": 0.0, "gld_5d": 0.0}
     groq_strategy = "CRISIS_CASH"
 
 if groq_strategy and groq_strategy in STRATEGY_LIBRARY:
@@ -396,27 +511,45 @@ else:
     else: UNIVERSE = ["NVDA", "AMD", "MSFT", "META", "TSLA", "AVGO"]; risk_frac = 0.005; sl_mult = 3.0; tp_mult = None; time_stop = 60
 
 # ==============================================================================
-# ORGAN 2/4: FUNNEL & SHIELD
+# ORGAN 2/4: FUNNEL & SHIELD (with Gap-Down + Sector Rotation Override)
 # ==============================================================================
 print("\n⚡ [ORGAN 2/4: FUNNEL & SHIELD] Scanning...")
 if not UNIVERSE:
     print("  🛡️ Shield blocks directional equity. Standing down.")
     clean_targets = []
 else:
-    try:
-        data = yf.download(UNIVERSE, period="5d", progress=False)
-        close = data['Close'] if isinstance(data.columns, pd.MultiIndex) else data
-        returns = close.pct_change().iloc[-1].dropna()
-        sorted_tickers = returns.reindex(returns.abs().sort_values(ascending=False).index).index.tolist()
-    except: sorted_tickers = []
+    # SPECIAL CASE: SECTOR_ROTATION uses 20-day momentum ranking
+    if groq_strategy == "SECTOR_ROTATION":
+        try:
+            data = yf.download(UNIVERSE, period="1mo", progress=False)['Close']
+            if isinstance(data.columns, pd.MultiIndex): data = data.droplevel(0, axis=1)
+            mom_20d = (data.iloc[-1] / data.iloc[-20] - 1).sort_values(ascending=False)
+            sorted_tickers = mom_20d.head(3).index.tolist()
+        except: sorted_tickers = []
+    else:
+        try:
+            data = yf.download(UNIVERSE, period="5d", progress=False)
+            close = data['Close'] if isinstance(data.columns, pd.MultiIndex) else data
+            returns = close.pct_change().iloc[-1].dropna()
+            sorted_tickers = returns.reindex(returns.abs().sort_values(ascending=False).index).index.tolist()
+        except: sorted_tickers = []
 
     clean_targets = []
     for ticker in sorted_tickers[:5]:
         try:
             if not validate_ticker(ticker): continue
             stock = yf.Ticker(ticker)
-            current_price = float(close[ticker].iloc[-1]) 
+            current_price = float(close[ticker].iloc[-1]) if groq_strategy != "SECTOR_ROTATION" else float(data[ticker].iloc[-1])
             hist_3mo = stock.history(period="3mo")
+            
+            # NEW: Gap-Down Catching Filter
+            if len(hist_3mo) >= 2:
+                prev_close = float(hist_3mo['Close'].iloc[-2])
+                today_gap = (current_price / prev_close) - 1
+                if abs(today_gap) > 0.05:
+                    print(f"     ⚠️ {ticker}: {today_gap:+.1%} gap. Skipping (falling knife).")
+                    continue
+            
             rv_30 = np.log(hist_3mo['Close'] / hist_3mo['Close'].shift(1)).dropna().tail(30).std() * np.sqrt(252)
             iv = 0.0
             if stock.options:
@@ -426,7 +559,9 @@ else:
                     atm_c = calls.iloc[(calls['strike'] - current_price).abs().argsort()[:1]]
                     iv = float(atm_c['impliedVolatility'].values[0]) 
             if iv > 0 and rv_30 < (iv - 0.05): continue
-            clean_targets.append({"ticker": ticker, "move": float(returns[ticker])})
+            
+            move = float(returns[ticker]) if groq_strategy != "SECTOR_ROTATION" else float(mom_20d[ticker])
+            clean_targets.append({"ticker": ticker, "move": move})
             print(f"     ✅ {ticker}: Passed Shield.")
         except: continue
 
@@ -460,7 +595,45 @@ if clean_targets:
     except: pass
 
 # ==============================================================================
-# ORGAN 12 & 15: CHRONOS ALLOCATOR (FIXED: Actual Weekend Liquidation)
+# P1: GEMINI × GROQ CONSENSUS FILTER
+# ==============================================================================
+if candidates and GROQ_KEY:
+    print("\n🧠 [BRAIN-2] Groq consensus check...")
+    try:
+        tickers_list = [c['ticker'] for c in candidates]
+        groq_consensus_prompt = f"""Analyze these tickers for directional bias using recent news only: {', '.join(tickers_list)}.
+Return JSON array ONLY: [{{"ticker":"X","direction":"BULLISH/BEARISH","confidence":0-1}}]"""
+        
+        models_res = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {GROQ_KEY}"})
+        if models_res.status_code == 200:
+            all_models = [m['id'] for m in models_res.json().get('data', [])]
+            generative_models = [m for m in all_models if not any(x in m.lower() for x in ['guard', 'vision', 'whisper', 'tool'])]
+            target_model = next((m for m in generative_models if '70b' in m.lower() or '8b' in m.lower()), None)
+            if not target_model and generative_models: target_model = generative_models[0]
+            
+            if target_model:
+                payload = {"model": target_model, "messages": [{"role": "system", "content": "Output ONLY valid JSON."}, {"role": "user", "content": groq_consensus_prompt}], "temperature": 0.1}
+                res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}, json=payload, timeout=15)
+                if res.status_code == 200:
+                    raw = res.json()['choices'][0]['message']['content']
+                    groq_opinions_list = extract_json(raw)
+                    if isinstance(groq_opinions_list, list):
+                        groq_opinions = {o['ticker']: o for o in groq_opinions_list if isinstance(o, dict)}
+                        verified = []
+                        for c in candidates:
+                            g = groq_opinions.get(c['ticker'])
+                            if g and g.get('direction') == c['direction']:
+                                c['conviction'] = min(c['conviction'], g.get('confidence', 1.0))
+                                verified.append(c)
+                                print(f"   ✅ {c['ticker']}: Consensus ({c['direction']})")
+                            else:
+                                print(f"   ⚠️ {c['ticker']}: Models disagree. Skipped.")
+                        candidates = verified
+    except Exception as e:
+        print(f"  [WARN] Consensus check failed: {e}")
+
+# ==============================================================================
+# ORGAN 12/15: CHRONOS ALLOCATOR (P0 FIX: cancel_orders on weekend liq)
 # ==============================================================================
 print("\n⏱️ [ORGAN 12/15: CHRONOS] Allocating Time & Profit States...")
 now = datetime.now(timezone.utc)
@@ -470,27 +643,37 @@ if calendar_action == "LIQUIDATE_WEEKEND_RISK":
     try:
         pos = requests.get(f"{BASE_URL}/v2/positions", headers=ALPACA_HEADERS).json()
         for p in pos:
-            q = int(float(p.get('qty', 0)))
-            if q == 0: continue
-            side = "sell" if q > 0 else "buy"
-            requests.post(f"{BASE_URL}/v2/orders", headers=ALPACA_HEADERS,
-                json={"symbol": p['symbol'], "qty": str(abs(q)), "side": side, "type": "market", "time_in_force": "day"})
-            print(f"  ✂️ Liquidated {p['symbol']} x{abs(q)}")
+            sym = p['symbol']
+            # P0 FIX: Use DELETE with cancel_orders=true
+            requests.delete(
+                f"{BASE_URL}/v2/positions/{sym}?cancel_orders=true",
+                headers=ALPACA_HEADERS
+            )
+            print(f"  ✂️ Liquidated {sym} (legs canceled)")
     except Exception as e:
         print(f"  [WARN] Weekend liq failed: {e}")
 
 # ==============================================================================
-# EXECUTION HANDS (FIXED: order_class, Portfolio Heat, Duplicate Prevention)
+# EXECUTION HANDS (All Safeguards Active)
 # ==============================================================================
 print("\n⚔️ [HANDS] Executing with Guardrails...")
 todays_predictions = []
 
-# Check circuit breakers
+# Circuit breakers
 if not drawdown_breaker():
     candidates = []
 if not in_trading_window():
     print("  ⏰ Outside trading window. Standing down.")
     candidates = []
+if macro_blackout():
+    candidates = []
+
+# Fetch current positions for correlation check
+try:
+    pos_res = requests.get(f"{BASE_URL}/v2/positions", headers=ALPACA_HEADERS)
+    held_tickers = [p['symbol'] for p in (pos_res.json() if pos_res.status_code == 200 else [])]
+except:
+    held_tickers = []
 
 for c in candidates:
     ticker = c.get('ticker'); direction = c.get('direction')
@@ -518,6 +701,12 @@ for c in candidates:
         stop_distance = sl_pct * current_price
         qty = max(1, math.floor(risk_budget / stop_distance))
         
+        # Correlation penalty
+        penalty = portfolio_beta_penalty(ticker, held_tickers)
+        if penalty < 1.0:
+            qty = max(1, int(qty * penalty))
+            print(f"   📉 {ticker}: Correlation penalty {penalty:.2f}x → qty {qty}")
+        
         qty = check_volume_participation(ticker, qty)
         if qty <= 0: continue
         
@@ -540,7 +729,6 @@ for c in candidates:
         
         order_data = {"symbol": ticker, "qty": str(qty), "side": side, "type": "limit", "limit_price": str(limit_p), "time_in_force": "day"}
         
-        # FIXED: Proper order_class handling
         if tp_mult and tp_mult > 0:
             order_data["order_class"] = "bracket"
             tp_pct = (tp_mult * atr) / current_price
@@ -562,7 +750,6 @@ for c in candidates:
         if res.status_code in [200, 201]:
             order_id = res.json().get('id')
             print(f"  ✅ {ticker} ({direction}) QUEUED | Qty: {qty}")
-            # FIXED: Persist reasoning and state snapshot
             todays_predictions.append({
                 "order_id": order_id, "ticker": ticker, "catalyst": catalyst, 
                 "direction": direction, "entry": limit_p, "atr": atr, 
@@ -572,6 +759,7 @@ for c in candidates:
                 "state_snapshot": {k: round(float(v),3) if isinstance(v,(int,float)) else v for k,v in state.items()},
                 "strategy": groq_strategy
             })
+            held_tickers.append(ticker)
         else:
             print(f"  ❌ {ticker} REJECTED: {res.text[:50]}")
             
@@ -584,7 +772,7 @@ learn_multipliers()
 # ==============================================================================
 # ORGAN 8: HIPPOCAMPUS WRITE
 # ==============================================================================
-if GITHUB_TOKEN and REPO and (todays_predictions or memory.get("multipliers")):
+if GITHUB_TOKEN and REPO and (todays_predictions or memory.get("multipliers") or memory.get("strategy_stats")):
     print("\n🧠 [ORGAN 8: HIPPOCAMPUS] Committing Memory...")
     memory["predictions"].extend(todays_predictions)
     memory["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -595,9 +783,14 @@ if GITHUB_TOKEN and REPO and (todays_predictions or memory.get("multipliers")):
     except: pass
 
 if NTFY_TOPIC:
-    try: requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=f"APEX-K V11.0 Run\nStrategy: {groq_strategy or 'FALLBACK'}\nTrades: {len(todays_predictions)}\nWin Rate: {memory.get('win_rate', 0):.1%}".encode('utf-8'), headers={"Title": "APEX-K Run"})
+    try: 
+        stats = memory.get("strategy_stats", {})
+        strat_summary = "\n".join([f"  {s}: {v['wr']:.0%} ({v['total']})" for s, v in list(stats.items())[:3]])
+        requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", 
+            data=f"APEX-K V12.0 Run\nStrategy: {groq_strategy or 'FALLBACK'}\nTrades: {len(todays_predictions)}\nWin Rate: {memory.get('win_rate', 0):.1%}\n{strat_summary}".encode('utf-8'), 
+            headers={"Title": "APEX-K Run"})
     except: pass
 
 print("\n" + "="*70)
-print("✅ APEX-K V11.0 CYCLE COMPLETE. ALL CRITICAL BUGS FIXED.")
+print("✅ APEX-K V12.0 CYCLE COMPLETE. ORPHAN BUG FIXED. ELITE MODE ACTIVE.")
 print("="*70)
