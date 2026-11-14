@@ -1,0 +1,3 @@
+concurrency:
+ group: apex-k-run
+  cancel-in-progress: false
