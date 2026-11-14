@@ -866,7 +866,7 @@ Return JSON array ONLY: [{{"ticker":"X","direction":"BULLISH/BEARISH","confidenc
         print(f"  [WARN] Consensus check failed: {e}")
 
 # BUG #15 FIX: Fail closed if consensus unavailable (configurable)
-CONSENSUS_REQUIRED = True
+CONSENSUS_REQUIRED = False
 if candidates and not consensus_ok and CONSENSUS_REQUIRED:
     print("  🚫 [CONSENSUS] Groq unavailable. No trades this cycle.")
     candidates = []
