@@ -23,7 +23,7 @@ GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
 GROQ_KEY = os.environ.get('GROQ_API_KEY')
 ALPACA_KEY = os.environ.get('ALPACA_API_KEY')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY')
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+AGITHUB_TOKEN = os.environ.get('AGITHUB_TOKEN')
 REPO = os.environ.get('GITHUB_REPOSITORY')
 NTFY_TOPIC = os.environ.get('NTFY_TOPIC')
 
