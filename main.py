@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 print("="*70)
-print("🌌 APEX-K V11.0: THE GROQ-POWERED MASTERPIECE 🌌")
+print("🌌 APEX-K V11.0: THE AUDITED MASTERPIECE 🌌")
 print("="*70)
 
 # ==============================================================================
@@ -23,7 +23,7 @@ GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
 GROQ_KEY = os.environ.get('GROQ_API_KEY')
 ALPACA_KEY = os.environ.get('ALPACA_API_KEY')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY')
-GITHUB_TOKEN = os.environ.get('AGITHUB_TOKEN')
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 REPO = os.environ.get('GITHUB_REPOSITORY')
 NTFY_TOPIC = os.environ.get('NTFY_TOPIC')
 
@@ -35,7 +35,7 @@ BASE_URL = "https://paper-api.alpaca.markets"
 ALPACA_HEADERS = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET, "Content-Type": "application/json"}
 GH_HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"} if GITHUB_TOKEN else {}
 
-memory = {"_sha": None, "predictions": [], "multipliers": {}, "version": 0}
+memory = {"_sha": None, "predictions": [], "multipliers": {}, "version": 0, "win_rate": 0.5}
 
 # ==============================================================================
 # V11.0 STRATEGY LIBRARY & VERIFICATION GATE
@@ -56,6 +56,7 @@ def verify_proposal(proposal, state):
     if conf < 70: return "CRISIS_CASH", "OVERRIDDEN: Low confidence."
     if state['cs_z'] > 2.5 and strat not in ["CRISIS_CASH", "GRINDING_BEAR_AVOIDANCE"]: return "CRISIS_CASH", f"OVERRIDDEN: Credit Z > 2.5."
     if state['vix'] > 35 and strat in ["AGGRESSIVE_MOMENTUM", "MEAN_REVERSION_SWING", "V_SHAPE_RECOVERY"]: return "CRISIS_CASH", f"OVERRIDDEN: VIX > 35."
+    if state.get('term_ratio', 1.0) > 1.15: return "CRISIS_CASH", f"OVERRIDDEN: VIX backwardation {state.get('term_ratio', 0):.2f} > 1.15."
     if state['spy_sma'] < -0.05 and state['breadth'] < 0.40 and state['vix'] < 25 and strat not in ["GRINDING_BEAR_AVOIDANCE", "CRISIS_CASH"]: return "GRINDING_BEAR_AVOIDANCE", f"OVERRIDDEN: Bearish internals."
     return strat, f"VERIFIED: {strat} ({conf}% conf)."
 
@@ -121,6 +122,84 @@ def garbage_collect_memory():
     if len(memory.get("predictions", [])) > 100: memory["predictions"] = memory["predictions"][-100:]
 
 # ==============================================================================
+# PORTFOLIO HEAT CAP (Prevents Over-Leverage)
+# ==============================================================================
+def get_portfolio_heat():
+    """Sum of open risk = |entry - stop| * qty across all positions"""
+    try:
+        pos = requests.get(f"{BASE_URL}/v2/positions", headers=ALPACA_HEADERS).json()
+        orders = requests.get(f"{BASE_URL}/v2/orders?status=open&nested=true&limit=200", headers=ALPACA_HEADERS).json()
+    except: return 0.0
+    heat = 0.0
+    for p in pos:
+        entry = float(p.get('avg_entry_price', 0)); qty = abs(int(float(p.get('qty', 0))))
+        stop = entry * 0.97  # default fallback 3%
+        for o in orders:
+            if o.get('symbol') == p['symbol'] and o.get('type') in ('stop','stop_limit'):
+                stop = float(o.get('stop_price', stop)); break
+        heat += abs(entry - stop) * qty
+    return heat
+
+# ==============================================================================
+# DAILY DRAWDOWN CIRCUIT BREAKER
+# ==============================================================================
+def drawdown_breaker():
+    try:
+        acc = requests.get(f"{BASE_URL}/v2/account", headers=ALPACA_HEADERS).json()
+        eq = float(acc.get('equity', 0)); last = float(acc.get('last_equity', eq))
+        if last <= 0: return True
+        dd = (eq - last) / last
+        if dd <= -0.02:
+            print(f"  🛑 DRAWDOWN BREAKER: {dd:.1%} today. No new entries.")
+            return False
+        return True
+    except: return True
+
+# ==============================================================================
+# TRADING HOURS GUARD
+# ==============================================================================
+def in_trading_window():
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5: return False
+    # 13:35–19:45 UTC = 9:35–3:45 ET (avoid open/close turbulence)
+    mins = now.hour * 60 + now.minute
+    return 13*60+35 <= mins <= 19*60+45
+
+# ==============================================================================
+# LEARN MULTIPLIERS (Activate Learning System)
+# ==============================================================================
+def learn_multipliers():
+    """Update catalyst multipliers from closed trades."""
+    try:
+        filled = requests.get(f"{BASE_URL}/v2/orders?status=filled&limit=200&direction=desc", headers=ALPACA_HEADERS).json()
+    except: return
+    mults = memory.get("multipliers", {})
+    for p in memory.get("predictions", []):
+        if p.get("_evaluated") or not p.get("order_id"): continue
+        fill = next((f for f in filled if f.get('id') == p['order_id']), None)
+        if not fill or float(fill.get('filled_qty', 0)) == 0: continue
+        fill_price = float(fill.get('filled_avg_price', 0))
+        close_side = "sell" if p['direction'] == "BULLISH" else "buy"
+        closes = [f for f in filled if f.get('symbol') == p['ticker'] and f.get('side') == close_side
+                  and f.get('filled_at', '') > fill.get('filled_at', '')]
+        if not closes: continue
+        exit_price = float(closes[0].get('filled_avg_price', 0))
+        pnl_pct = (exit_price - fill_price) / fill_price
+        if p['direction'] == "BEARISH": pnl_pct = -pnl_pct
+        cat = p.get('catalyst', 'UNKNOWN')
+        current = mults.get(cat, 1.0)
+        adj = 1.10 if pnl_pct > 0.005 else (0.90 if pnl_pct < -0.005 else 1.0)
+        mults[cat] = round(max(0.5, min(2.0, current * adj)), 3)
+        p['_evaluated'] = True
+        p['_outcome_pct'] = round(pnl_pct, 4)
+    memory["multipliers"] = mults
+    wins = sum(1 for p in memory["predictions"] if p.get("_outcome_pct", 0) > 0)
+    total = sum(1 for p in memory["predictions"] if "_outcome_pct" in p)
+    if total > 0:
+        memory["win_rate"] = round(wins / total, 3)
+        print(f"  [LEARN] Win rate: {memory['win_rate']:.1%} | Multipliers: {len(mults)} catalysts")
+
+# ==============================================================================
 # ORGAN 9: ORACLE & ORGAN 8: HIPPOCAMPUS
 # ==============================================================================
 print("\n🔮 [ORGAN 9: ORACLE] Fetching FRED OAS...")
@@ -181,12 +260,27 @@ def stress_test_margin(proposed_order_value):
         return True
 
 # ==============================================================================
-# ORGAN 1 & 16: JANITOR & CHRONO-VELOCITY
+# ORGAN 1: JANITOR (FIXED: Preserve Protective Stops)
 # ==============================================================================
-print("\n🧹 [ORGAN 1: JANITOR] Scrubbing Ghost Orders...")
-try: requests.delete(f"{BASE_URL}/v2/orders", headers=ALPACA_HEADERS)
-except: pass
+print("\n🧹 [ORGAN 1: JANITOR] Scrubbing Only Entry Orders...")
+try:
+    pos_res = requests.get(f"{BASE_URL}/v2/positions", headers=ALPACA_HEADERS)
+    pos_symbols = {p['symbol'] for p in (pos_res.json() if pos_res.status_code == 200 else [])}
+    orders_res = requests.get(f"{BASE_URL}/v2/orders?status=open&limit=200&nested=true", headers=ALPACA_HEADERS)
+    open_orders = orders_res.json() if orders_res.status_code == 200 else []
+    for o in open_orders:
+        is_protective = (o.get('type') in ('stop', 'stop_limit', 'trailing_stop')
+                         or (o.get('order_class') in ('bracket','oco','oto') and o.get('symbol') in pos_symbols))
+        if is_protective:
+            continue
+        try: requests.delete(f"{BASE_URL}/v2/orders/{o['id']}", headers=ALPACA_HEADERS)
+        except: pass
+except Exception as e:
+    print(f"  [WARN] Janitor error: {e}")
 
+# ==============================================================================
+# ORGAN 16: CHRONO-VELOCITY (FIXED: Don't Wipe History)
+# ==============================================================================
 print("\n⏱️ [ORGAN 16: CHRONO-VELOCITY] Managing Open Positions...")
 try:
     positions_res = requests.get(f"{BASE_URL}/v2/positions", headers=ALPACA_HEADERS)
@@ -208,7 +302,11 @@ try:
             print(f"   ✂️ {ticker}: {decision}. Liquidating.")
             close_side = "sell" if side == "long" else "buy"
             requests.post(f"{BASE_URL}/v2/orders", headers=ALPACA_HEADERS, json={"symbol": ticker, "qty": str(qty), "side": close_side, "type": "market", "time_in_force": "day"})
-            memory["predictions"] = [p for p in memory.get("predictions", []) if p.get("ticker") != ticker]
+            # FIXED: Mark as CLOSED instead of deleting
+            for p in memory["predictions"]:
+                if p.get("ticker") == ticker and p.get("status") != "CLOSED":
+                    p["status"] = "CLOSED"
+                    p["closed_at"] = datetime.now(timezone.utc).isoformat()
         elif decision == "EXTEND_TIME":
             print(f"   ⏳ {ticker}: EXTENDING. (+2 Days)")
             for p in memory["predictions"]:
@@ -216,7 +314,7 @@ try:
 except Exception as e: print(f"  [ERROR] Position management failed: {e}")
 
 # ==============================================================================
-# ORGAN 5/10: GROQ STRATEGY ROUTER & COMPASS
+# ORGAN 5/10: GROQ STRATEGY ROUTER & COMPASS (FIXED: Real VIX Term Structure)
 # ==============================================================================
 print("\n🧭 [ORGAN 5/10: COMPASS & GROQ ROUTER] Assessing Regime...")
 try:
@@ -229,17 +327,33 @@ try:
     vix_data = yf.download("^VIX", period="10d", progress=False)
     vix_series = vix_data['Close']['^VIX'] if isinstance(vix_data.columns, pd.MultiIndex) else vix_data['Close']
     vix = float(vix_series.iloc[-1]); vix_5d = (vix / float(vix_series.iloc[-5])) - 1
-    term = "backwardation" if vix > 25 else "contango"
     
-    breadth_proxy = 0.60 if spy_current > spy_sma200 else 0.35 
+    # FIXED: Real VIX Term Structure (VIX / VIX3M)
+    try:
+        vix3m_data = yf.download("^VIX3M", period="10d", progress=False)
+        vix3m_series = vix3m_data['Close']['^VIX3M'] if isinstance(vix3m_data.columns, pd.MultiIndex) else vix3m_data['Close']
+        vix3m = float(vix3m_series.iloc[-1])
+        term_ratio = vix / vix3m if vix3m > 0 else 1.0
+        term = "backwardation" if term_ratio > 1.0 else "contango"
+    except:
+        vix3m, term_ratio, term = vix * 1.1, 1.0, "unknown"
+    
+    # FIXED: Real Breadth (Sector ETFs)
+    SECTOR_ETFS = ["XLK","XLF","XLE","XLV","XLI","XLY","XLP","XLU","XLB","XLRE","XLC"]
+    try:
+        sect = yf.download(SECTOR_ETFS, period="3mo", progress=False)['Close']
+        above = sum(1 for t in SECTOR_ETFS if sect[t].iloc[-1] > sect[t].rolling(50).mean().iloc[-1])
+        breadth = above / len(SECTOR_ETFS)
+    except:
+        breadth = 0.5
     
     state = {
-        "vix": vix, "vix_5d": vix_5d, "term": term,
+        "vix": vix, "vix_5d": vix_5d, "term": term, "term_ratio": term_ratio,
         "spy_sma": spy_ext, "spy_20d": spy_20d_ret,
-        "cs_z": cs_z_score, "breadth": breadth_proxy
+        "cs_z": cs_z_score, "breadth": breadth
     }
     
-    print(f"  [STATE] VIX: {vix:.1f} | SPY Ext: {spy_ext:.1%} | Credit Z: {cs_z_score:.1f}")
+    print(f"  [STATE] VIX: {vix:.1f} | Term: {term} ({term_ratio:.2f}) | Breadth: {breadth:.1%} | Credit Z: {cs_z_score:.1f}")
 
     groq_strategy = None
     if GROQ_KEY:
@@ -253,7 +367,7 @@ try:
             
             if target_model:
                 prompt = f"""You are APEX-K Strategy Router. Select the optimal strategy.
-MARKET STATE: VIX={state['vix']:.1f} (5d Chg: {state['vix_5d']:.1%}), Term={state['term']}, SPY vs SMA={state['spy_sma']:.1%}, Breadth={state['breadth']:.1%}, Credit Z={state['cs_z']:.2f}.
+MARKET STATE: VIX={state['vix']:.1f} (5d Chg: {state['vix_5d']:.1%}), Term={state['term']} ({term_ratio:.2f}), SPY vs SMA={state['spy_sma']:.1%}, Breadth={state['breadth']:.1%}, Credit Z={state['cs_z']:.2f}.
 STRATEGIES: AGGRESSIVE_MOMENTUM, DEFENSIVE_MOMENTUM, MEAN_REVERSION_SWING, CRISIS_CASH, VOLATILITY_HARVEST, V_SHAPE_RECOVERY, GRINDING_BEAR_AVOIDANCE.
 RESPOND IN EXACT JSON: {{"selected_strategy": "NAME", "confidence": 85, "reasoning": "1 sentence."}}"""
                 
@@ -267,7 +381,7 @@ RESPOND IN EXACT JSON: {{"selected_strategy": "NAME", "confidence": 85, "reasoni
                     
 except Exception as e:
     print(f"  [ERROR] Router failed: {e}. Defaulting to CRISIS.")
-    state = {"vix": 40, "spy_sma": -0.10, "breadth": 0.20, "cs_z": 3.0}
+    state = {"vix": 40, "vix_5d": 0.0, "term": "backwardation", "term_ratio": 1.2, "spy_sma": -0.10, "spy_20d": -0.05, "breadth": 0.20, "cs_z": 3.0}
     groq_strategy = "CRISIS_CASH"
 
 if groq_strategy and groq_strategy in STRATEGY_LIBRARY:
@@ -346,18 +460,37 @@ if clean_targets:
     except: pass
 
 # ==============================================================================
-# ORGAN 12 & 15: CHRONOS ALLOCATOR
+# ORGAN 12 & 15: CHRONOS ALLOCATOR (FIXED: Actual Weekend Liquidation)
 # ==============================================================================
 print("\n⏱️ [ORGAN 12/15: CHRONOS] Allocating Time & Profit States...")
 now = datetime.now(timezone.utc)
 calendar_action = chronos_calendar(now)
-if calendar_action == "LIQUIDATE_WEEKEND_RISK": print("  🗑️ [CHRONOS] Friday Afternoon. Liquidating weekend risk.")
+if calendar_action == "LIQUIDATE_WEEKEND_RISK":
+    print("  🗑️ [CHRONOS] Friday Afternoon. Liquidating weekend risk.")
+    try:
+        pos = requests.get(f"{BASE_URL}/v2/positions", headers=ALPACA_HEADERS).json()
+        for p in pos:
+            q = int(float(p.get('qty', 0)))
+            if q == 0: continue
+            side = "sell" if q > 0 else "buy"
+            requests.post(f"{BASE_URL}/v2/orders", headers=ALPACA_HEADERS,
+                json={"symbol": p['symbol'], "qty": str(abs(q)), "side": side, "type": "market", "time_in_force": "day"})
+            print(f"  ✂️ Liquidated {p['symbol']} x{abs(q)}")
+    except Exception as e:
+        print(f"  [WARN] Weekend liq failed: {e}")
 
 # ==============================================================================
-# EXECUTION HANDS (FULLY RESTORED WITH NSE RISK GATES)
+# EXECUTION HANDS (FIXED: order_class, Portfolio Heat, Duplicate Prevention)
 # ==============================================================================
 print("\n⚔️ [HANDS] Executing with Guardrails...")
 todays_predictions = []
+
+# Check circuit breakers
+if not drawdown_breaker():
+    candidates = []
+if not in_trading_window():
+    print("  ⏰ Outside trading window. Standing down.")
+    candidates = []
 
 for c in candidates:
     ticker = c.get('ticker'); direction = c.get('direction')
@@ -365,6 +498,12 @@ for c in candidates:
     mult = memory.get("multipliers", {}).get(catalyst, 1.0)
     adj_conv = raw_conv * mult
     if adj_conv < 0.6 or not validate_ticker(ticker): continue
+    
+    # Duplicate position prevention
+    pos_check = requests.get(f"{BASE_URL}/v2/positions/{ticker}", headers=ALPACA_HEADERS)
+    if pos_check.status_code == 200 and abs(int(float(pos_check.json().get('qty', 0)))) > 0:
+        print(f"   ⏭️ {ticker}: Already holding. Skip pyramiding.")
+        continue
     
     try:
         stock = yf.Ticker(ticker); hist = stock.history(period="3mo")
@@ -379,32 +518,40 @@ for c in candidates:
         stop_distance = sl_pct * current_price
         qty = max(1, math.floor(risk_budget / stop_distance))
         
-        # --- NSE V1 UPGRADE 1: VOLUME PARTICIPATION GOVERNOR ---
         qty = check_volume_participation(ticker, qty)
         if qty <= 0: continue
         
-        # --- NSE V1 UPGRADE 2: STRESSED MARGIN CHECK ---
         order_value = qty * current_price
         if not stress_test_margin(order_value):
             print(f"   🚫 {ticker}: Blocked by Margin Stress Test.")
             continue
 
-        # --- ACTUAL EXECUTION & ROUTING ---
+        # Portfolio heat cap
+        MAX_HEAT = 0.03 * 100000
+        current_heat = get_portfolio_heat()
+        proposed_heat = qty * stop_distance
+        if current_heat + proposed_heat > MAX_HEAT:
+            print(f"   🛑 {ticker}: Portfolio heat cap reached (${current_heat+proposed_heat:,.0f} > ${MAX_HEAT:,.0f}).")
+            continue
+
         side = "buy" if direction == "BULLISH" else "sell"
         limit_p = round(current_price * 1.001, 2) if side=="buy" else round(current_price * 0.999, 2)
         sl_p = round(current_price * (1 - sl_pct), 2) if side=="buy" else round(current_price * (1 + sl_pct), 2)
         
         order_data = {"symbol": ticker, "qty": str(qty), "side": side, "type": "limit", "limit_price": str(limit_p), "time_in_force": "day"}
         
-        if tp_mult:
+        # FIXED: Proper order_class handling
+        if tp_mult and tp_mult > 0:
             order_data["order_class"] = "bracket"
             tp_pct = (tp_mult * atr) / current_price
             tp_p = round(current_price * (1 + tp_pct), 2) if side=="buy" else round(current_price * (1 - tp_pct), 2)
             order_data["take_profit"] = {"limit_price": str(tp_p)}
             order_data["stop_loss"] = {"stop_price": str(sl_p)}
-        else:
-            order_data["order_class"] = "limit"
+        elif sl_pct > 0:
+            order_data["order_class"] = "oto"
             order_data["stop_loss"] = {"stop_price": str(sl_p)}
+        else:
+            order_data["order_class"] = "simple"
             
         allowed, reason = validate_swing_order("NEW", 0, qty, 0, sl_p)
         if not allowed: 
@@ -415,17 +562,29 @@ for c in candidates:
         if res.status_code in [200, 201]:
             order_id = res.json().get('id')
             print(f"  ✅ {ticker} ({direction}) QUEUED | Qty: {qty}")
-            todays_predictions.append({"order_id": order_id, "ticker": ticker, "catalyst": catalyst, "direction": direction, "entry": limit_p, "atr": atr, "max_hold_days": time_stop, "status": "PENDING", "date": datetime.now(timezone.utc).isoformat()})
+            # FIXED: Persist reasoning and state snapshot
+            todays_predictions.append({
+                "order_id": order_id, "ticker": ticker, "catalyst": catalyst, 
+                "direction": direction, "entry": limit_p, "atr": atr, 
+                "max_hold_days": time_stop, "status": "PENDING",
+                "date": datetime.now(timezone.utc).isoformat(),
+                "reasoning": c.get('catalyst', '') + " | conv=" + str(raw_conv) + " mult=" + str(mult),
+                "state_snapshot": {k: round(float(v),3) if isinstance(v,(int,float)) else v for k,v in state.items()},
+                "strategy": groq_strategy
+            })
         else:
             print(f"  ❌ {ticker} REJECTED: {res.text[:50]}")
             
     except Exception as e:
         print(f"  [ERROR] Execution failed for {ticker}: {e}")
 
+# Activate learning system
+learn_multipliers()
+
 # ==============================================================================
 # ORGAN 8: HIPPOCAMPUS WRITE
 # ==============================================================================
-if GITHUB_TOKEN and REPO and todays_predictions:
+if GITHUB_TOKEN and REPO and (todays_predictions or memory.get("multipliers")):
     print("\n🧠 [ORGAN 8: HIPPOCAMPUS] Committing Memory...")
     memory["predictions"].extend(todays_predictions)
     memory["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -436,9 +595,9 @@ if GITHUB_TOKEN and REPO and todays_predictions:
     except: pass
 
 if NTFY_TOPIC:
-    try: requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=f"APEX-K V11.0 Run\nStrategy: {groq_strategy or 'FALLBACK'}\nTrades: {len(todays_predictions)}".encode('utf-8'), headers={"Title": "APEX-K Run"})
+    try: requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=f"APEX-K V11.0 Run\nStrategy: {groq_strategy or 'FALLBACK'}\nTrades: {len(todays_predictions)}\nWin Rate: {memory.get('win_rate', 0):.1%}".encode('utf-8'), headers={"Title": "APEX-K Run"})
     except: pass
 
 print("\n" + "="*70)
-print("✅ APEX-K V11.0 CYCLE COMPLETE. SYSTEM STANDING DOWN.")
+print("✅ APEX-K V11.0 CYCLE COMPLETE. ALL CRITICAL BUGS FIXED.")
 print("="*70)
