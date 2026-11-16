@@ -1412,8 +1412,8 @@ def manage_positions(headers: Dict[str, str], predictions: List[Prediction],
                     _refresh_status(pred)
                     log.error(f"{pred.ticker}: cannot persist cancel intent; aborting")
                     continue
-                ok, timed_out = alpaca_delete(f"/v2/orders/{pred.order_id}", headers)
-                if not ok and not timed_out:
+                del_status, timed_out = alpaca_delete(f"/v2/orders/{pred.order_id}", headers)
+                if del_status != DeleteStatus.SUCCESS and not timed_out:
                     pred.entry_cancel_pending = False
                     _refresh_status(pred)
                     memory["predictions"] = predictions
