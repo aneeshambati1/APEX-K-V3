@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APEX-K • Live Dashboard</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,'Segoe UI',Roboto,sans-serif;padding:16px;max-width:960px;margin:0 auto}
+header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+h1{font-size:1.3rem}h1 span{color:var(--blue)}
+a{color:var(--blue);text-decoration:none}
+button{background:var(--blue);color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:.9rem}
+.banner{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-weight:600;border:1px solid}
+.ok{background:#0f2417;border-color:var(--green);color:var(--green)}
+.warn{background:#241c0f;border-color:var(--amber);color:var(--amber)}
+.err{background:#2d1214;border-color:var(--red);color:var(--red)}
+.idle{background:var(--card);border-color:var(--border);color:var(--dim)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card .label{color:var(--dim);font-size:.75rem;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.card .value{font-size:1.25rem;font-weight:700}
+.card .sub{color:var(--dim);font-size:.8rem;margin-top:4px}
+section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px}
+section h2{font-size:1rem;margin-bottom:10px;color:var(--dim)}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th{color:var(--dim);text-align:left;font-weight:500;padding:6px 8px;border-bottom:1px solid var(--border)}
+td{padding:8px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:0}
+.wrap{overflow-x:auto}
+.badge{padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:600}
+.b-green{background:#0f2417;color:var(--green)}.b-red{background:#2d1214;color:var(--red)}
+.b-amber{background:#241c0f;color:var(--amber)}.b-dim{background:#21262d;color:var(--dim)}
+.alert{padding:8px 12px;border-left:3px solid var(--red);background:#2d1214;margin-bottom:6px;border-radius:4px;font-size:.85rem}
+footer{color:var(--dim);font-size:.75rem;text-align:center;margin-top:20px;line-height:1.6}
+.mono{font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 APEX-K <span>Live Dashboard</span></h1>
+  <div><a href="https://github.com/aneeshambati1/APEX-K-V3" target="_blank">Repo ↗</a>&nbsp;&nbsp;<button onclick="load()">↻ Refresh</button></div>
+</header>
+
+<div id="banner" class="banner idle">Loading…</div>
+
+<div class="cards">
+  <div class="card"><div class="label">Last Run</div><div class="value" id="last-run">—</div><div class="sub" id="last-run-sub">—</div></div>
+  <div class="card"><div class="label">Next Run (8:00 PM IST)</div><div class="value mono" id="countdown">—</div><div class="sub" id="next-ist">—</div></div>
+  <div class="card"><div class="label">Bot Cycles</div><div class="value" id="cycles">—</div><div class="sub" id="mem-updated">—</div></div>
+  <div class="card"><div class="label">Tracked Trades</div><div class="value" id="trades">—</div><div class="sub">open / closed / pending</div></div>
+</div>
+
+<section id="alerts-sec" style="display:none"><h2>🚨 Attention Required</h2><div id="alerts"></div></section>
+
+<section><h2>📦 Open Positions (from bot memory) — <a href="https://app.alpaca.markets/paper/dashboard/overview" target="_blank">live P&L on Alpaca ↗</a></h2>
+<div class="wrap"><table><thead><tr><th>Ticker</th><th>Qty</th><th>Entry</th><th>Status</th><th>Age</th></tr></thead><tbody id="positions"><tr><td colspan="5">Loading…</td></tr></tbody></table></div></section>
+
+<section><h2>⚙️ Workflow Run History</h2>
+<div class="wrap"><table><thead><tr><th>Started (IST)</th><th>Trigger</th><th>Result</th><th>Duration</th><th>Logs</th></tr></thead><tbody id="runs"><tr><td colspan="5">Loading…</td></tr></tbody></table></div></section>
+
+<footer>Data: public GitHub API · auto-refresh every 5 min · no keys stored<br>
+Bot runs 14:30 UTC Mon–Fri = 8:00 PM IST · GitHub may delay 15–60 min · <span id="ratelimit"></span></footer>
+
+<script>
+const REPO="aneeshambati1/APEX-K-V3", API="https://api.github.com/repos/"+REPO;
+const $=id=>document.getElementById(id);
+const ist=d=>new Date(d).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:true});
+const b64=s=>new TextDecoder().decode(Uint8Array.from(atob(s.replace(/\n/g,'')),c=>c.charCodeAt(0)));
+
+function nextRun(){
+  const now=new Date();
+  let d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),14,30,0));
+  if(d<=now)d.setUTCDate(d.getUTCDate()+1);
+  while(d.getUTCDay()===0||d.getUTCDay()===6)d.setUTCDate(d.getUTCDate()+1);
+  return d;
+}
+const NR=nextRun();
+$('next-ist').textContent=ist(NR)+" IST";
+setInterval(()=>{
+  let ms=NR-new Date(); if(ms<0){location.reload();return;}
+  const h=Math.floor(ms/3.6e6),m=Math.floor(ms%3.6e6/6e4),s=Math.floor(ms%6e4/1e3);
+  $('countdown').textContent=`${h}h ${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+},1000);
+
+function conclBadge(r){
+  if(r.status!=="completed")return '<span class="badge b-amber">🔄 '+r.status+'</span>';
+  const c=r.conclusion;
+  if(c==="success")return '<span class="badge b-green">✅ success</span>';
+  if(c==="failure")return '<span class="badge b-red">❌ failure</span>';
+  return '<span class="badge b-dim">'+c+'</span>';
+}
+function trigBadge(e){
+  if(e==="schedule")return '<span class="badge b-green">⏰ auto</span>';
+  if(e==="workflow_dispatch")return '<span class="badge b-dim">👆 manual</span>';
+  return '<span class="badge b-dim">'+e+'</span>';
+}
+
+async function load(){
+  $('banner').className='banner idle';$('banner').textContent='Fetching live data…';
+  try{
+    const [rr,mr]=await Promise.all([
+      fetch(API+"/actions/runs?per_page=15",{headers:{Accept:"application/vnd.github+json"}}),
+      fetch(API+"/contents/memory/memory.json",{headers:{Accept:"application/vnd.github+json"}})
+    ]);
+    const rem=rr.headers.get('x-ratelimit-remaining');
+    if(rem)$('ratelimit').textContent='API calls left this hour: '+rem;
+    if(!rr.ok)throw new Error("Runs API HTTP "+rr.status);
+    const runs=(await rr.json()).workflow_runs||[];
+
+    // Runs table
+    $('runs').innerHTML=runs.length?runs.map(r=>{
+      const dur=r.updated_at&&r.run_started_at?Math.round((new Date(r.updated_at)-new Date(r.run_started_at))/1000)+'s':'—';
+      return `<tr><td>${ist(r.run_started_at)}</td><td>${trigBadge(r.event)}</td><td>${conclBadge(r)}</td><td>${dur}</td><td><a href="${r.html_url}" target="_blank">View ↗</a></td></tr>`;
+    }).join(''):'<tr><td colspan="5">No runs yet.</td></tr>';
+
+    // Last run card
+    const last=runs[0];
+    if(last){
+      $('last-run').innerHTML=conclBadge(last);
+      $('last-run-sub').textContent=ist(last.run_started_at)+" · "+last.event;
+    }else{$('last-run').textContent='None';$('last-run-sub').textContent='never run';}
+
+    // Memory
+    let mem=null;
+    if(mr.ok){mem=JSON.parse(b64((await mr.json()).content));}
+    const preds=mem?(mem.predictions||[]):[];
+    const openS=["FILLED","PARTIALLY_FILLED","PARTIALLY_EXITED","EXIT_PENDING"];
+    const pendS=["PENDING","INTENT_PENDING","ENTRY_PARTIALLY_FILLED","ENTRY_CANCEL_PENDING"];
+    const open=preds.filter(p=>openS.includes(p.status));
+    const closed=preds.filter(p=>p.status==="CLOSED");
+    const pend=preds.filter(p=>pendS.includes(p.status));
+
+    $('cycles').textContent=mem?(mem.version??0):'—';
+    $('mem-updated').textContent=mem&&mem.updated_at?"updated "+ist(mem.updated_at):(mem?"no timestamp":"no memory yet");
+    $('trades').textContent=`${open.length} / ${closed.length} / ${pend.length}`;
+
+    // Positions
+    $('positions').innerHTML=open.length?open.map(p=>{
+      const age=p.date?Math.floor((Date.now()-new Date(p.date))/8.64e7)+'d':'—';
+      return `<tr><td><b>${p.ticker||'?'}</b></td><td>${p.qty_filled??'?'}</td><td>$${Number(p.entry_price||0).toFixed(2)}</td><td><span class="badge b-amber">${p.status}</span></td><td>${age}</td></tr>`;
+    }).join(''):'<tr><td colspan="5">'+(mem?'Flat — no open positions.':'Waiting for first saved cycle.')+'</td></tr>';
+
+    // Alerts
+    const problems=preds.filter(p=>p.validation_error||p.status==="RECONCILIATION_REQUIRED"||(p.last_reconciliation_error&&!["CLOSED","DEAD"].includes(p.status)));
+    if(problems.length){
+      $('alerts-sec').style.display='block';
+      $('alerts').innerHTML=problems.slice(0,10).map(p=>`<div class="alert"><b>${p.ticker||'?'}</b>: ${p.validation_error||p.last_reconciliation_error||p.status}</div>`).join('');
+    }else{$('alerts-sec').style.display='none';}
+
+    // Banner
+    if(last&&last.conclusion==="failure"){$('banner').className='banner err';$('banner').textContent='❌ LAST RUN FAILED — check logs below';}
+    else if(problems.length){$('banner').className='banner warn';$('banner').textContent=`⚠️ OPERATIONAL — ${problems.length} prediction(s) need attention`;}
+    else if(mem){$('banner').className='banner ok';$('banner').textContent='✅ OPERATIONAL — bot state clean';}
+    else{$('banner').className='banner idle';$('banner').textContent='⏳ WAITING — no memory yet. First scheduled run creates it.';}
+  }catch(e){
+    $('banner').className='banner err';$('banner').textContent='⚠️ '+e.message+' (rate limit? wait a few min)';
+  }
+}
+load();
+setInterval(load,300000);
+</script>
+</body>
+</html>
