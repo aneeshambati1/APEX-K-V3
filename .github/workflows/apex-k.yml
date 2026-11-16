@@ -2,8 +2,11 @@ name: APEX-K Trading Bot
 
 on:
   schedule:
-    - cron: '30 14 * * 1-5'  # Keep as-is per your request
+    - cron: '30 14 * * 1-5'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 concurrency:
   group: apex-k-cycle
@@ -13,14 +16,19 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python main.py
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run APEX-K V14.3.9
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python main.py
