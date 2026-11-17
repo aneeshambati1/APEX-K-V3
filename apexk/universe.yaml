@@ -1,0 +1,22 @@
+# Initial APEX-K ETF universe.
+# This is a configuration list, not a recommendation to trade.
+
+universe:
+  - SPY
+  - QQQ
+  - IWM
+  - EFA
+  - EEM
+  - TLT
+  - IEF
+  - GLD
+  - DBC
+  - VNQ
+  - HYG
+  - LQD
+  - UUP
+
+constraints:
+  long_only: true
+  allow_short_selling: false
+  allow_fractional_shares: true
