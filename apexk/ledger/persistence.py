@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import List
 
-from apexk.contracts import LedgerEvent if False else Side
+from apexk.contracts import Side
 from apexk.exceptions import PersistenceError
 from apexk.ledger.events import LedgerEvent
 
