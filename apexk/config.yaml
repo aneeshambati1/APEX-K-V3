@@ -1,0 +1,14 @@
+# APEX-K MAJOR application configuration
+# Paper trading only. No live trading is permitted.
+
+mode: paper
+paper_trading: true
+
+base_currency: USD
+initial_cash: 100000.00
+
+data_provider: manual
+broker_provider: local_paper
+
+max_positions: 3
+log_level: INFO
